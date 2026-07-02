@@ -9,7 +9,7 @@ IFS=$'\n\t'
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-VERSION="2.0"
+VERSION="3.0"
 BASE="/opt/vicisoc"
 ENV_FILE="$BASE/vicisoc.env"
 LOG_DIR="$BASE/logs"
@@ -17,6 +17,13 @@ LOG_FILE="$LOG_DIR/vicisoc.log"
 BACKUP_DIR="$BASE/backups"
 LOCK_FILE="/var/run/vicisoc.lock"
 OSSEC_CONF="/var/ossec/etc/ossec.conf"
+
+# Idempotency markers — every XML block ViciSOC ever writes into ossec.conf
+# is wrapped in exactly one of these, so re-runs are detected and skipped
+# instead of duplicated.
+LOG_MARKER="<!-- ViciSOC:LOG_MONITORING -->"
+FIM_MARKER="<!-- ViciSOC:FIM -->"
+AR_MARKER="<!-- ViciSOC:ACTIVE_RESPONSE_PLACEHOLDER -->"
 
 GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[1;33m"; BLUE="\033[0;34m"; NC="\033[0m"
 
@@ -98,8 +105,7 @@ root_check() {
 
 writable_check() {
     local dir="$1"
-    if [ ! -w "$dir" ] 2>/dev/null && [ ! -d "$dir" ]; then
-        # dir may not exist yet; test parent
+    if [ ! -d "$dir" ]; then
         dir="$(dirname "$dir")"
     fi
     if [ ! -w "$dir" ]; then
@@ -119,14 +125,23 @@ detect_os() {
         fail "Cannot detect OS (no /etc/os-release). Unsupported system."
         exit 1
     fi
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_VERSION="${VERSION_ID:-unknown}"
+
+    local id="" version_id="" pretty_name=""
+    while IFS='=' read -r key val; do
+        val="${val%\"}"; val="${val#\"}"
+        case "$key" in
+            ID) id="$val" ;;
+            VERSION_ID) version_id="$val" ;;
+            PRETTY_NAME) pretty_name="$val" ;;
+        esac
+    done < /etc/os-release
+
+    OS_ID="${id:-unknown}"
+    OS_VERSION="${version_id:-unknown}"
 
     case "$OS_ID" in
         almalinux|rocky|centos|rhel)
-            ok "Detected supported OS: ${PRETTY_NAME:-$OS_ID} ($OS_VERSION)"
+            ok "Detected supported OS: ${pretty_name:-$OS_ID} ($OS_VERSION)"
             ;;
         *)
             fail "Unsupported OS: $OS_ID. This script supports AlmaLinux/Rocky/CentOS/RHEL only."
@@ -183,7 +198,9 @@ check_dependencies() {
 # Init / bootstrap
 # ---------------------------------------------------------------------------
 init() {
-    mkdir -p "$BASE/modules" "$LOG_DIR" "$BACKUP_DIR"
+    # Clean, minimal footprint on disk — no bin/ or state/ directories,
+    # since ViciSOC no longer generates or installs any standalone scripts.
+    mkdir -p "$LOG_DIR" "$BACKUP_DIR"
     touch "$ENV_FILE"
     chmod 700 "$BASE"
     chmod 600 "$ENV_FILE"
@@ -194,7 +211,8 @@ init() {
 }
 
 # ---------------------------------------------------------------------------
-# Env file helpers — safe read/write, no duplicate keys, no blind sourcing
+# Env file helpers — safe read/write, no duplicate keys, no blind sourcing.
+# Nothing in this script ever executes vicisoc.env as shell code.
 # ---------------------------------------------------------------------------
 env_get() {
     local key="$1"
@@ -203,7 +221,7 @@ env_get() {
 }
 
 env_set() {
-    # Idempotent set: removes existing key, appends new value
+    # Idempotent set: removes existing key, appends new value.
     local key="$1" value="$2"
     local tmp
     tmp="$(mktmp)"
@@ -237,10 +255,6 @@ validate_url() {
     [[ "$1" =~ ^https://hooks\.slack\.com/services/.+ ]]
 }
 
-validate_generic_url() {
-    [[ "$1" =~ ^https?://[a-zA-Z0-9./_%-]+$ ]]
-}
-
 validate_vt_key() {
     # VirusTotal API keys are 64-char hex
     [[ "$1" =~ ^[a-fA-F0-9]{64}$ ]]
@@ -260,8 +274,8 @@ validate_ip() {
     [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
 }
 
-reject_shell_metachars() {
-    [[ "$1" != *[\;\&\|\`\$\(\)\<\>]* ]]
+validate_positive_int() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
 }
 
 confirm() {
@@ -297,7 +311,7 @@ restore_file() {
 # ---------------------------------------------------------------------------
 xml_block_present() {
     local marker="$1"
-    [ -f "$OSSEC_CONF" ] && grep -q "$marker" "$OSSEC_CONF"
+    [ -f "$OSSEC_CONF" ] && grep -q -F "$marker" "$OSSEC_CONF"
 }
 
 wazuh_installed() {
@@ -355,7 +369,8 @@ commit_and_verify() {
 }
 
 # inject_xml_block: generic helper for blocks that are always safe as a
-# top-level sibling (e.g. <localfile>) — inserted before </ossec_config>.
+# top-level sibling (e.g. <localfile>, comments) — inserted before
+# </ossec_config>.
 inject_xml_block() {
     local marker="$1"
     local block="$2"
@@ -433,6 +448,24 @@ status() {
         warn "VirusTotal Not Configured"
     fi
 
+    if xml_block_present "$LOG_MARKER" 2>/dev/null; then
+        ok "Log Monitoring Configured"
+    else
+        warn "Log Monitoring Not Configured"
+    fi
+
+    if xml_block_present "$FIM_MARKER" 2>/dev/null; then
+        ok "File Integrity Monitoring Configured"
+    else
+        warn "File Integrity Monitoring Not Configured"
+    fi
+
+    if xml_block_present "$AR_MARKER" 2>/dev/null; then
+        ok "Active Response Placeholder Present"
+    else
+        warn "Active Response Placeholder Not Configured"
+    fi
+
     echo
 }
 
@@ -457,7 +490,7 @@ system_check() {
     uptime || true
     echo
     echo "-- Firewall --"
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --state 2>/dev/null || true
     else
         warn "firewalld not active"
@@ -570,6 +603,68 @@ virustotal() {
 }
 
 # ---------------------------------------------------------------------------
+# Settings — general values reserved for future features (e.g. a manager-
+# side Active Response rollout). Stored in the same single vicisoc.env,
+# never duplicated elsewhere.
+# ---------------------------------------------------------------------------
+settings() {
+    clear
+    echo "========= SETTINGS ========="
+    echo
+
+    local cur_mgr cur_alma cur_bt
+    cur_mgr="$(env_get MANAGER_IP 2>/dev/null || echo "not set")"
+    cur_alma="$(env_get ALMA_SERVER_IP 2>/dev/null || echo "not set")"
+    cur_bt="$(env_get BLOCK_TIME 2>/dev/null || echo "not set")"
+
+    echo "Current values:"
+    echo "  MANAGER_IP     : $cur_mgr"
+    echo "  ALMA_SERVER_IP : $cur_alma"
+    echo "  BLOCK_TIME     : $cur_bt (seconds — reserved for future Active Response use)"
+    echo
+
+    if ! confirm "Update settings now?"; then
+        pause
+        return
+    fi
+
+    read -r -p "Wazuh Manager IP [$cur_mgr]: " MGR
+    MGR="$(echo "$MGR" | xargs)"
+    if [ -n "$MGR" ]; then
+        if validate_ip "$MGR"; then
+            env_set MANAGER_IP "$MGR"
+            ok "MANAGER_IP saved."
+        else
+            fail "Invalid IP format. MANAGER_IP not changed."
+        fi
+    fi
+
+    read -r -p "AlmaLinux Server IP [$cur_alma]: " ALMA
+    ALMA="$(echo "$ALMA" | xargs)"
+    if [ -n "$ALMA" ]; then
+        if validate_ip "$ALMA"; then
+            env_set ALMA_SERVER_IP "$ALMA"
+            ok "ALMA_SERVER_IP saved."
+        else
+            fail "Invalid IP format. ALMA_SERVER_IP not changed."
+        fi
+    fi
+
+    read -r -p "Block Time in seconds [$cur_bt]: " BT
+    BT="$(echo "$BT" | xargs)"
+    if [ -n "$BT" ]; then
+        if validate_positive_int "$BT"; then
+            env_set BLOCK_TIME "$BT"
+            ok "BLOCK_TIME saved."
+        else
+            fail "Must be a positive integer. BLOCK_TIME not changed."
+        fi
+    fi
+
+    pause
+}
+
+# ---------------------------------------------------------------------------
 # Log monitoring (idempotent XML injection)
 # ---------------------------------------------------------------------------
 logs() {
@@ -577,7 +672,18 @@ logs() {
     echo "========= LOG MONITORING ========="
     echo
 
-    local marker="<!-- ViciSOC:LOG_MONITORING -->"
+    if ! wazuh_installed; then
+        fail "Wazuh not installed."
+        pause
+        return
+    fi
+
+    if xml_block_present "$LOG_MARKER"; then
+        warn "Log monitoring already configured by ViciSOC. Skipping (idempotent)."
+        pause
+        return
+    fi
+
     local block
     block=$(cat <<'EOF'
 <localfile>
@@ -591,7 +697,7 @@ logs() {
 </localfile>
 EOF
 )
-    inject_xml_block "$marker" "$block" && ok "Log monitoring enabled." || fail "Log monitoring not applied."
+    inject_xml_block "$LOG_MARKER" "$block" && ok "Log monitoring enabled." || fail "Log monitoring not applied."
     pause
 }
 
@@ -603,15 +709,13 @@ fim() {
     echo "========= FILE INTEGRITY MONITORING ========="
     echo
 
-    local marker="<!-- ViciSOC:FIM -->"
-
     if ! wazuh_installed; then
         fail "Wazuh not installed."
         pause
         return
     fi
 
-    if xml_block_present "$marker"; then
+    if xml_block_present "$FIM_MARKER"; then
         warn "FIM already configured by ViciSOC. Skipping (idempotent)."
         pause
         return
@@ -637,7 +741,7 @@ EOF
         # adding a second, potentially conflicting <syscheck> block.
         info "Existing <syscheck> block found — merging directories into it."
         local content
-        content="$(printf '%s\n%s' "$marker" "$dirs")"
+        content="$(printf '%s\n%s' "$FIM_MARKER" "$dirs")"
         if insert_before_tag "$OSSEC_CONF" "$content" "</syscheck>" "first"; then
             inserted=true
         fi
@@ -646,7 +750,7 @@ EOF
         local block
         block="$(printf '<syscheck>\n%s\n</syscheck>' "$dirs")"
         local content
-        content="$(printf '%s\n%s' "$marker" "$block")"
+        content="$(printf '%s\n%s' "$FIM_MARKER" "$block")"
         if insert_before_tag "$OSSEC_CONF" "$content" "</ossec_config>" "last"; then
             inserted=true
         fi
@@ -663,11 +767,24 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Active response — unblock-ip script
+# Active Response — PLACEHOLDER ONLY.
+#
+# This does not install, generate, or execute any scripts, and it does not
+# touch iptables/firewalld/nftables. It only reserves a documented, clearly
+# commented-out section inside ossec.conf so a future version of ViciSOC
+# (or a manual admin) has an obvious, safe place to wire up real Active
+# Response commands later — on the Wazuh manager, where that config
+# actually belongs.
 # ---------------------------------------------------------------------------
-active() {
+active_response_placeholder() {
     clear
-    echo "========= ACTIVE RESPONSE ========="
+    echo "========= ACTIVE RESPONSE (FUTURE PLACEHOLDER) ========="
+    echo
+    echo "This option does NOT install any scripts and does NOT touch your"
+    echo "firewall. It only adds a commented-out, documented placeholder"
+    echo "block to ossec.conf so real Active Response commands can be"
+    echo "wired up later. Real Active Response <command>/<active-response>"
+    echo "stanzas belong on the Wazuh manager, not the agent."
     echo
 
     if ! wazuh_installed; then
@@ -676,52 +793,70 @@ active() {
         return
     fi
 
-    local ar_dir="/var/ossec/active-response/bin"
-    local ar_script="$ar_dir/unblock-ip.sh"
-    mkdir -p "$ar_dir"
-
-    if [ -f "$ar_script" ]; then
-        warn "Active response script already installed. Skipping (idempotent)."
+    if xml_block_present "$AR_MARKER"; then
+        warn "Active Response placeholder already present. Skipping (idempotent)."
         pause
         return
     fi
 
-    cat > "$ar_script" <<'EOF'
-#!/bin/bash
-# ViciSOC active response: remove an iptables DROP rule for a given IP.
-set -euo pipefail
-IP="${1:-}"
-
-is_valid_ip() {
-    local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        IFS='.' read -r -a o <<< "$ip"
-        for octet in "${o[@]}"; do [ "$octet" -le 255 ] || return 1; done
-        return 0
+    if ! confirm "Insert the Active Response placeholder into ossec.conf?"; then
+        pause
+        return
     fi
-    [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" == *:* ]]
+
+    local block
+    block=$(cat <<'EOF'
+<!-- ============================================================== -->
+<!-- ViciSOC Active Response placeholder.                            -->
+<!-- Nothing below is active. No commands run from this block.       -->
+<!--                                                                  -->
+<!-- Example of what a real Active Response wiring looks like        -->
+<!-- (this belongs on the Wazuh MANAGER, not this agent config):     -->
+<!--                                                                  -->
+<!--   <command>                                                     -->
+<!--     <name>block-ip</name>                                       -->
+<!--     <executable>block-ip.sh</executable>                        -->
+<!--     <timeout_allowed>yes</timeout_allowed>                      -->
+<!--   </command>                                                    -->
+<!--                                                                  -->
+<!--   <active-response>                                             -->
+<!--     <command>block-ip</command>                                 -->
+<!--     <location>local</location>                                  -->
+<!--     <rules_id>5710</rules_id>                                   -->
+<!--     <timeout>3600</timeout>                                     -->
+<!--   </active-response>                                            -->
+<!-- ============================================================== -->
+EOF
+)
+    inject_xml_block "$AR_MARKER" "$block" \
+        && ok "Active Response placeholder inserted." \
+        || fail "Placeholder not applied."
+    pause
 }
 
-if [ -z "$IP" ] || ! is_valid_ip "$IP"; then
-    echo "$(date) INVALID_IP_ARG '$IP'" >> /var/ossec/logs/active-responses.log
-    exit 1
-fi
+# ---------------------------------------------------------------------------
+# Wazuh Integration submenu
+# ---------------------------------------------------------------------------
+wazuh_integration_menu() {
+    while true; do
+        clear
+        echo "========= WAZUH INTEGRATION ========="
+        echo
+        echo "1  Log Monitoring"
+        echo "2  File Integrity Monitoring"
+        echo "3  Active Response (Future Placeholder)"
+        echo "0  Back to Main Menu"
+        echo "======================================"
+        read -r -p "Select: " SUBOP
 
-if command -v iptables >/dev/null 2>&1; then
-    iptables -D INPUT -s "$IP" -j DROP 2>/dev/null || true
-fi
-if command -v ip6tables >/dev/null 2>&1 && [[ "$IP" == *:* ]]; then
-    ip6tables -D INPUT -s "$IP" -j DROP 2>/dev/null || true
-fi
-
-echo "$(date) UNBLOCK $IP" >> /var/ossec/logs/active-responses.log
-echo "Removed block for $IP"
-EOF
-
-    chmod 750 "$ar_script"
-    chown root:root "$ar_script"
-    ok "Active response script installed at $ar_script"
-    pause
+        case "$SUBOP" in
+            1) logs ;;
+            2) fim ;;
+            3) active_response_placeholder ;;
+            0) return ;;
+            *) echo "Invalid option."; sleep 1 ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -753,6 +888,24 @@ verify() {
         all_ok=false
     fi
 
+    if xml_block_present "$LOG_MARKER" 2>/dev/null; then
+        ok "Log Monitoring configured"
+    else
+        warn "Log Monitoring not configured"
+    fi
+
+    if xml_block_present "$FIM_MARKER" 2>/dev/null; then
+        ok "File Integrity Monitoring configured"
+    else
+        warn "File Integrity Monitoring not configured"
+    fi
+
+    if xml_block_present "$AR_MARKER" 2>/dev/null; then
+        ok "Active Response Placeholder present"
+    else
+        warn "Active Response Placeholder not configured (optional)"
+    fi
+
     local perm
     perm=$(stat -c '%a' "$ENV_FILE" 2>/dev/null || echo "??")
     if [ "$perm" = "600" ]; then
@@ -763,7 +916,7 @@ verify() {
 
     echo
     if $all_ok; then
-        ok "Installation Successful — all checks passed."
+        ok "Installation Successful — all core checks passed."
     else
         warn "Some checks failed. Review the output above and $LOG_FILE."
     fi
@@ -771,7 +924,7 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# Menu
+# Main menu
 # ---------------------------------------------------------------------------
 menu() {
     while true; do
@@ -781,10 +934,9 @@ menu() {
         echo "1  System Check"
         echo "2  Slack Setup"
         echo "3  VirusTotal Setup"
-        echo "4  Log Monitoring"
-        echo "5  File Integrity Monitoring"
-        echo "6  Active Response Tools"
-        echo "7  Verify Installation"
+        echo "4  Settings"
+        echo "5  Wazuh Integration"
+        echo "6  Verify Installation"
         echo "0  Exit"
         echo "===================================="
         read -r -p "Select: " OP
@@ -793,10 +945,9 @@ menu() {
             1) system_check ;;
             2) slack ;;
             3) virustotal ;;
-            4) logs ;;
-            5) fim ;;
-            6) active ;;
-            7) verify ;;
+            4) settings ;;
+            5) wazuh_integration_menu ;;
+            6) verify ;;
             0) echo "Goodbye."; exit 0 ;;
             *) echo "Invalid option."; sleep 1 ;;
         esac
